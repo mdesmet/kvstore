@@ -1,7 +1,10 @@
 use clap::{App, Arg, SubCommand};
+use std::path::Path;
 use std::process::exit;
+use kvs::Result;
+use kvs::KvStore;
 
-fn main() {
+fn main() -> Result<()> {
     let matches = App::new(env!("CARGO_PKG_NAME"))
         .version(env!("CARGO_PKG_VERSION"))
         .author(env!("CARGO_PKG_AUTHORS"))
@@ -30,7 +33,7 @@ fn main() {
         )
         .subcommand(
             SubCommand::with_name("rm")
-                .about("retrieve value from key value store")
+                .about("remove value from key value store")
                 .arg(Arg::with_name("key").index(1).required(true)),
         )
         .get_matches();
@@ -38,21 +41,42 @@ fn main() {
     // We can find out whether or not debugging was turned on
     if matches.is_present("version") {
         println!("Installed version: {}", env!("CARGO_PKG_VERSION"));
-        std::process::exit(0);
+        exit(0);
     }
 
+    let mut store = KvStore::open(Path::new("."))?;
+
     match matches.subcommand() {
-        ("get", Some(_matches)) => {
-            eprintln!("unimplemented");
-            exit(1);
+        ("get", Some(matches)) => {
+            let key = matches.value_of("key").unwrap();
+            let value = store.get(key.to_owned())?;
+            match value {
+                Some(value) => {
+                    println!("{}", value);
+                    exit(0);
+                },
+                None => {
+                    println!("Key not found");
+                    exit(0);
+                }
+            }
         }
-        ("set", Some(_matches)) => {
-            eprintln!("unimplemented");
-            exit(1)
+        ("set", Some(matches)) => {
+            let key = matches.value_of("key").unwrap();
+            let value = matches.value_of("value").unwrap();
+            store.set(key.to_owned(), value.to_owned())?;
+            exit(0);
         }
-        ("rm", Some(_matches)) => {
-            eprintln!("unimplemented");
-            std::process::exit(1);
+        ("rm", Some(matches)) => {
+            let key = matches.value_of("key").unwrap();
+            match store.remove(key.to_owned()) {
+                Ok(_) => exit(0),
+                Err(_) => {
+                    println!("Key not found");
+                    exit(-1);
+                }
+            }
+            
         }
         _ => unreachable!(),
     }

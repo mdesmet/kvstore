@@ -1,44 +1,88 @@
-# PNA Rust Project 1: The Rust toolbox
+# PNA Rust Project 2: Log-structured file I/O
 
-**Task**: Create an in-memory key/value store that passes simple tests and responds
-to command-line arguments.
+**Task**: Create a _persistent_ key/value store that _can be accessed from the
+command line_.
 
 **Goals**:
 
-- Install the Rust compiler and tools
-- Learn the project structure used throughout this course
-- Use `cargo init` / `run` / `test` / `clippy` / `fmt`
-- Learn how to find and import crates from crates.io
-- Define an appropriate data type for a key-value store
+- Handle and report errors robustly
+- Use serde for serialization
+- Write data to disk as a log using standard file APIs
+- Read the state of the key/value store from disk
+- Map in-memory key-indexes to on-disk values
+- Periodically compact the log to remove stale data
 
-**Topics**: testing, the `clap` crate, `CARGO_VERSION` etc., the `clippy` and
-  `rustfmt` tools.
-
-**Extensions**: the `structopt` crate.
+**Topics**: log-structured file I/O, bitcask, the `failure` crate, `Read` /
+`Write` traits, the `serde` crate.
 
 - [Introduction](#user-content-introduction)
+- [Terminology](#user-content-terminology)
 - [Project spec](#user-content-project-spec)
-- [Installation](#user-content-installation)
 - [Project setup](#user-content-project-setup)
-- [Part 1: Make the tests compile](#user-content-part-1-make-the-tests-compile)
-  - [Aside: Testing tips](#user-content-aside-testing-tips)
-- [Part 2: Accept command line arguments](#user-content-part-2-accept-command-line-arguments)
-- [Part 3: Cargo environment variables](#user-content-part-3-cargo-environment-variables)
-- [Part 4: Store values in memory](#user-content-part-4-store-values-in-memory)
-- [Part 5: Documentation](#user-content-part-5-documentation)
-- [Part 6: Ensure good style with `clippy` and `rustfmt`](#user-content-part-6-ensure-good-style-with-clippy-and-rustfmt)
-- [Extension 1: `structopt`](#user-content-extension-1-structopt)
+- [Part 1: Error handling](#user-content-part-1-error-handling)
+- [Part 2: How the log behaves](#user-content-part-2-how-the-log-behaves)
+- [Part 3: Writing to the log](#user-content-part-3-writing-to-the-log)
+- [Part 4: Reading from the log](#user-content-part-4-reading-from-the-log)
+- [Part 5: Storing log pointers in the index](#user-content-part-5-storing-log-pointers-in-the-index)
+- [Part 6: Stateless vs. stateful `KvStore`](#user-content-part-6-stateless-vs-stateful-kvstore)
+- [Part 7: Compacting the log](#user-content-part-7-compacting-the-log)
 
 
 ## Introduction
 
-In this project you will create a simple in-memory key/value store that maps
-strings to strings, and that passes some tests and responds to command line
-arguments. The focus of this project is on the tooling and setup that goes into
-a typical Rust project.
+In this project you will create a simple on-disk key/value store that can be
+modified and queried from the command line. It will use a simplification of the
+storage algorithm used by [bitcask], chosen for its combination of simplicity
+and effectiveness. You will start by maintaining a _log_ (sometimes called a
+["write-ahead log"][wal] or "WAL") on disk of previous write commands that is
+evaluated on startup to re-create the state of the database in memory. Then you
+will extend that by storing only the keys in memory, along with offsets into the
+on-disk log. Finally, you will introduce log compaction so that it does not grow
+indefinitely. At the end of this project you will have built a simple, but
+well-architected database using Rust file APIs.
 
-If this sounds basic to you, please do the project anyway as it discusses some
-general patterns that will be used throughout the course.
+[wal]: https://en.wikipedia.org/wiki/Write-ahead_logging
+[bitcask]: https://github.com/basho/bitcask
+
+
+<!--
+## Basic database architecture
+
+TODO
+
+- Basic description and terminology of log, memtable, blocks, etc
+- good opportunity for a diagram
+- find a good background reading
+- using the os page cache for caching
+-->
+
+## Terminology
+
+Some terminology we will use in this course. It is the same as or inspired by
+[bitcask]. Different databases will have slightly different terminology.
+
+- _command_ - A request or the representation of a request made to the database.
+  These are issued on the command line or over the network. They have an
+  in-memory representation, a textual representation, and a machine-readable
+  serialized representation.
+- _log_ - An on-disk sequence of commands, in the order originally received and
+  executed. Our database's on-disk format is almost entirely made up of logs. It
+  will be simple, but also surprisingly efficient.
+- _log pointer_ - A file offset into the log. Sometimes we'll just call this a
+  "file offset".
+- _log compaction_ - As writes are issued to the database they sometimes
+  invalidate old log entries. For example, writing key/value `a = 0` then
+  writing `a = 1`, makes the first log entry for "a" useless. Compaction &mdash;
+  in our database at least &mdash; is the process of reducing the size of the
+  database by remove stale commands from the log.
+- _in-memory index_ (or _index_) - A map of keys to log pointers. When a read
+  request is issued, the in-memory index is searched for the appropriate log
+  pointer, and when it is found the value is retrieved from the on-disk log. In
+  our key/value store, like in bitcask, the index for the _entire database_ is
+  stored in memory.
+- _index file_ - The on-disk representation of the in-memory index. Without this
+  the log would need to be completely replayed to restore the state of the
+  in-memory index each time the database is started.
 
 
 ## Project spec
@@ -50,15 +94,18 @@ The `kvs` executable supports the following command line arguments:
 
 - `kvs set <KEY> <VALUE>`
 
-  Set the value of a string key to a string
+  Set the value of a string key to a string.
+  Print an error and return a non-zero exit code on failure.
 
 - `kvs get <KEY>`
 
-  Get the string value of a given string key
+  Get the string value of a given string key.
+  Print an error and return a non-zero exit code on failure.
 
 - `kvs rm <KEY>`
 
-  Remove a given key
+  Remove a given key.
+  Print an error and return a non-zero exit code on failure.
 
 - `kvs -V`
 
@@ -67,611 +114,370 @@ The `kvs` executable supports the following command line arguments:
 The `kvs` library contains a type, `KvStore`, that supports the following
 methods:
 
-- `KvStore::set(&mut self, key: String, value: String)`
+- `KvStore::set(&mut self, key: String, value: String) -> Result<()>`
 
-  Set the value of a string key to a string
+  Set the value of a string key to a string.
+  Return an error if the value is not written successfully.
 
-- `KvStore::get(&self, key: String) -> Option<String>`
+- `KvStore::get(&mut self, key: String) -> Result<Option<String>>`
 
-  Get the string value of the a string key. If the key does not exist,
-  return `None`.
+  Get the string value of a string key.
+  If the key does not exist, return `None`.
+  Return an error if the value is not read successfully.
 
-- `KvStore::remove(&mut self, key: String)`
+- `KvStore::remove(&mut self, key: String) -> Result<()>`
 
   Remove a given key.
+  Return an error if the key does not exist or is not removed successfully.
 
-The `KvStore` type stores values in-memory, and thus the command-line client can
-do little more than print the version. The `get`/ `set` / `rm` commands will 
-return an "unimplemented" error when run from the command line. Future projects 
-will store values on disk and have a working command line interface.
+- `KvStore::open(path: impl Into<PathBuf>) -> Result<KvStore>`
 
+  Open the KvStore at a given path.
+  Return the KvStore.
 
-## Installation
+When setting a key to a value, `kvs` writes the `set` command to disk in a
+sequential log, then stores the log pointer (file offset) of that command in the
+in-memory index from key to pointer. When removing a key, similarly, `kvs`
+writes the `rm` command in the log, then removes the key from the in-memory
+index.  When retrieving a value for a key with the `get` command, it searches
+the index, and if found then loads from the log the command at the corresponding
+log pointer, evaluates the command and returns the result.
 
-At this point in your Rust programming experience you should know
-how to install Rust via [rustup].
+On startup, the commands in the log are traversed from oldest to newest, and the
+in-memory index rebuilt.
 
-[rustup]: https://www.rustup.rs
+When the size of the uncompacted log entries reach a given threshold, `kvs`
+compacts it into a new log, removing redundent entries to reclaim disk space.
 
-If you haven't already, do so now by running
-
-```
-curl https://sh.rustup.rs -sSf | sh
-```
-
-(If you are running Windows then follow the instructions on rustup.rs. Note
-though that you will face more challenges than others during this course, as it
-was developed on Unix. In general, Rust development on Windows is a less
-polished experience than on Unix).
-
-Verify that the toolchain works by typing `rustc -V`. If that doesn't work, log
-out and log in again so that changes to the login profile made during
-installation can take effect.
+Note that our `kvs` project is both a stateless command-line program, and a
+library containing a stateful `KvStore` type: for CLI use the `KvStore` type
+will load the index, execute the command, then exit; for library use it will
+load the index, then execute multiple commands, maintaining the index state,
+until it is dropped.
 
 
 ## Project setup
 
-You will do the work for this project in your own git repository, with your own
-Cargo project. You will import the test cases for the project from the [source
-repository for this course][course].
+Continuing from your previous project, delete your previous `tests` directory and
+copy this project's `tests` directory into its place. Like the previous project,
+this project should contain a library and an executable, both named `kvs`.
 
-[course]: https://github.com/pingcap/talent-plan
-
-Note that within that repository, all content related to this course is within
-the `rust` subdirectory. You may ignore any other directories.
-
-The projects in this course contain both libraries and executables. They are
-executables because we are developing an application that can be run. They are
-libraries because the supplied test cases must link to them.
-
-We'll use the same setup for each project in this course.
-
-The directory layout we will use is:
-
-```
-├── Cargo.toml
-├── src
-│   ├── bin
-│   │   └── kvs.rs
-│   └── lib.rs
-└── tests
-    └── tests.rs
-```
-
-The `Cargo.toml`, `lib.rs` and `kvs.rs` files look as follows:
-
-`Cargo.toml`:
-
-```toml
-[package]
-name = "kvs"
-version = "0.1.0"
-authors = ["Brian Anderson <andersrb@gmail.com>"]
-description = "A key-value store"
-edition = "2018"
-```
-
-`lib.rs`:
-
-```rust
-// just leave it empty for now
-```
-
-`kvs.rs`:
-
-```rust
-fn main() {
-    println!("Hello, world!");
-}
-```
-
-The author should be yourself, but the name needs to be `kvs` in order for the
-test cases to work. That's because the project name is also the name of the
-library it contains. Likewise the name of the binary (the command line
-application) needs to be `kvs`. In the above setup it will be `kvs` implicitly
-based on the file name, but you could name the file whatever you wanted by
-putting the appropriate information in the manifest (`Cargo.toml`).
-
-You may set up this project with `cargo new --lib`, `cargo init --lib` (in a
-clean directory), or manually. You'll probably also want to initialize a git
-repository in the same directory.
-
-Finally, the `tests` directory is copied from the course materials. In this case,
-copy from the course repository the file `rust/projects/project-1/tests`
-into your own repository, as `tests`.
-
-At this point you should be able to run the program with `cargo run`.
-
-_Try it now._
-
-You are set up for this project and ready to start hacking.
-
-
-## Part 1: Make the tests compile
-
-You've been provided with a suite of unit tests in `tests/tests.rs`. Open it up
-and take a look.
-
-_Try to run the tests with `cargo test`._ What happens? Why?
-
-Your first task for this project is to make the tests _compile_. Fun!
-
-If your project is like mine you probably saw a huge spew of build errors. Look
-at the first few. In general, when you see a bunch of errors, the first are the
-most important &mdash; `rustc` will keep trying to compile even after hitting
-errors, so errors can cascade, the later ones being pretty meaningless. Your
-first few errors probably look like:
-
-```
-error[E0433]: failed to resolve: use of undeclared type or module `assert_cmd`
- --> tests/tests.rs:1:5
-  |
-1 | use assert_cmd::prelude::*;
-  |     ^^^^^^^^^^ use of undeclared type or module `assert_cmd`
-
-error[E0432]: unresolved import
- --> tests/tests.rs:3:5
-  |
-3 | use predicates::str::contains;
-  |     ^^^^^^^^^^^^^^^^^^^^^^^^^
-```
-
-(If you are seeing something else, please file an issue).
-
-These two errors are quite hard to diagnose to a new Rust programmer so I'll
-just tell you what's going on here: you are missing [dev-dependency] crates
-in your manifest.
-
-[dev-dependency]: https://doc.rust-lang.org/cargo/reference/specifying-dependencies.html#development-dependencies
-
-For this project your `Cargo.toml` file needs to contain these lines:
+You need the following dev-dependencies in your `Cargo.toml`:
 
 ```toml
 [dev-dependencies]
 assert_cmd = "0.11.0"
 predicates = "1.0.0"
+tempfile = "3.0.7"
+walkdir = "2.2.7"
 ```
 
-The details of these dependencies are not important to you completing the
-project, but you might want to investigate them on your own. We didn't tell you
-about the need for dev-deps earlier just so you would experience these errors
-yourself. In future projects, the setup text will tell you the dev-deps you
-need.
-
-One quick note: how can you figure out that these errors are due to missing
-dependencies in your manifest and not due to errors in your source code? Here's
-one big clue, from the error shown previously:
-
-```
-1 | use assert_cmd::prelude::*;
-  |     ^^^^^^^^^^ use of undeclared type or module `assert_cmd`
-```
-
-In `use` statements the first path element is always the name of a crate. The
-exception to this is when the first path element references a name that was
-previously brought into scope with _another_ `use` statement. In other words, if
-there had been another `use` statement in this file like `use foo::assert_cmd`,
-then use `assert_cmd::prelude::*` would refer to _that_ `assert_cmd`. There is
-more that could be said about this but we shouldn't go deeper into the nuances
-of path resolution here. Just know that, in general, in a `use` statement, if
-the first element in the path isn't found (i.e. cannot be resolved), the problem
-is probably that the crate hasn't been named in the manifest.
-
-Whew. That is an unfortunate diversion in the very first project. But hopefully
-instructive.
-
-_Go ahead and add the appropriate dev-deps to your manifest._
-
-Try again to run the tests with `cargo test`. What happens? Why?
-
-Hopefully those _previous_ errors are gone. Now the errors are all about the
-test cases not being able to find all the code it expects in your own code.
-
-_So now your task is to outline all the types, methods, etc. necessary to make
-the tests build._
-
-During this course you will read the test cases a lot. The test cases tell you
-exactly what is expected of your code. If the text and the tests don't agree,
-the tests are right (file a bug!). This is true in the real world too. The test
-cases demonstrate what the software _actually_ does. They are reality. Get used
-to reading test cases.
-
-And, bonus &mdash; test cases are often the poorest-written code in any project,
-sloppy and undocumented.
-
-Again, try to run the tests with `cargo test`. What happens? Why?
-
-In `src/lib.rs` write the type and method definitions necessary to make `cargo
-test --no-run` complete successfully. Don't write any method bodies yet &mdash;
-instead write `panic!()`. This is the way to sketch out your APIs without
-knowing or caring about the implementation (there's also the [`unimplemented!`]
-macro, but since typing it is longer, it's common to simply use `panic!`, a
-possible exception being if you are releasing software that contains
-unimplemented methods).
-
-[`unimplemented!`]: https://doc.rust-lang.org/std/macro.unimplemented.html
-
-_Do that now before moving on._
-
-Once that is done, if you run `cargo test` (without `--no-run`),
-you should see that some of your tests are failing, like
-
-```
-    Finished dev [unoptimized + debuginfo] target(s) in 2.32s
-     Running target/debug/deps/kvs-b03a01e7008067f6
-
-running 0 tests
-
-test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
-
-     Running target/debug/deps/kvs-a3b5a004932c6715
-
-running 0 tests
-
-test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
-
-     Running target/debug/deps/tests-5e1c2e20bd1fa377
-
-running 13 tests
-test cli_get ... FAILED
-test cli_invalid_get ... FAILED
-test cli_invalid_rm ... FAILED
-test cli_invalid_set ... FAILED
-test cli_no_args ... FAILED
-test cli_invalid_subcommand ... FAILED
-... more lines of spew ...
-```
-
-... followed by many more lines. That's great! That's all we need right now.
-You'll make those pass throughout the rest of this project.
-
-
-### Aside: Testing tips
-
-If you look again at the output from `cargo test` you'll see something
-interesting:
-
-```
-     Running target/debug/deps/kvs-b03a01e7008067f6
-
-running 0 tests
-
-test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
-
-     Running target/debug/deps/kvs-a3b5a004932c6715
-
-running 0 tests
-
-test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
-
-     Running target/debug/deps/tests-5e1c2e20bd1fa377
-
-
-running 13 tests
-test cli_get ... FAILED
-```
-
-Cargo says "Running ..." three times. And the first two of those times it in
-fact did not run any tests. And furthermore, if all those tests hadn't failed,
-cargo would have run _yet another_ set of tests.
-
-Why is this?
-
-Well, it is because there are many places you can write tests in Rust:
-
-- Inside the source of your library
-- Inside the source of each of your binaries
-- Inside each test file
-- In the doc comments of your library
-
-And cargo doesn't know which of these actually contain tests, so it just builds
-and runs them all.
-
-So those two sets of empty tests:
-
-```
-     Running target/debug/deps/kvs-b03a01e7008067f6
-running 0 tests
-     Running target/debug/deps/kvs-a3b5a004932c6715
-running 0 tests
-```
-
-Well, this is a bit confusing, but one of them is your library, compiled for
-testing, and the other is your binary, compiled for testing. Neither contains
-any tests. The reason both have "kvs" in their names is because both your
-library and your binary are called "kvs".
-
-All this test spew gets annoying, and there are two ways to quiet cargo:
-with command line arguments, and with changes to the manifest.
-
-Here are the relevant command line flags:
-
-- `cargo test --lib` &mdash; test just the tests inside the library
-- `cargo test --doc` &mdash; test the doc tests in the library
-- `cargo test --bins` &mdash; test all the bins in the project
-- `cargo test --bin foo` &mdash; test just the `foo` bin
-- `cargo test --test foo` &mdash; test the tests in test file `foo`
-
-These are convenient to quickly hide test spew, but if a project doesn't contain
-a type of tests it's probably best to just never deal with them. If you recall
-from The Cargo Book's [manifest description][m], there are two keys that can be
-applied: `test = false` and `doctest = false`. They go in the `[lib]` and
-`[[bin]]` sections. Consider updating your manifest.
-
-[m]: https://doc.rust-lang.org/cargo/reference/manifest.html
-
-Another quick thing to do if you haven't before. Run this:
-
-```
-cargo test -- --help
-```
-
-Just do it. It's cool. What you are seeing there is the help information for
-_the executable containing your compiled tests_ (that `--` surrounded by spaces
-tells cargo to pass all following arguments to the test binary). It's not
-the same info displayed when you run `cargo test --help`. They are two different
-things: cargo is running your test bin by passing it all these various arguments.
-
-If you want you can do exactly the same thing. Let's go back one more time
-to our `cargo test` example. We saw this line:
-
-```
-     Running target/debug/deps/kvs-b03a01e7008067f6
-```
-
-That's cargo telling you the name of the test binary. You can run it
-yourself, like `target/debug/deps/kvs-b03a01e7008067f6 --help`.
-
-The `target` directory contains lots of cool stuff. Digging through it can teach
-you a lot about what the Rust toolchain is actually doing.
-
-In practice, particularly with large projects, you won't run the entire test
-suite while developing a single feature. To narrow down the set of tests to the
-ones we care about, run the following:
-
-```
-cargo test cli_no_args
-```
-
-This will run the test called `cli_no_args`. In fact, it will run any test
-containing `cli_no_args` in the name, so if, e.g., you want to run all the CLI
-tests, you can run `cargo test cli`. That's probably how you will be running the
-tests yourself as you work through the project, otherwise you will be distracted
-by the many failing tests that you have not yet fixed. Unfortunately that
-pattern is a simple substring match, not something fancy like a regular
-expression.
-
-<!-- TODO: need an excuse to explain `cargo test --test suite`.
-Per https://github.com/pingcap/talent-plan/pull/129#issuecomment-498477590
-we might organize the the test suite into test files by project section.
-Then we could talk about `cargo test --test part-1` -->
-
-Note that, as of this writing, the test cases for the projects in this course
-are not organized in a way that makes it clear which test cases should complete
-for any particular section of a project &mdash; only that by the end the entire
-suite should pass. You'll need to read the names and implementations of the
-tests to figure out which you _think_ should pass at any particular time.
-
-
-## Part 2: Accept command line arguments
-
-The key / value stores throughout this course are all controlled through a
-command-line client. In this project the command-line client is very simple
-because the state of the key-value store is only stored in memory, not persisted
-to disk.
-
-In this part you will make the `cli_*` test cases pass.
-
-Recall how to run individual test cases from previous sections
-of 
-
-Again, the interface for the CLI is:
-
-- `kvs set <KEY> <VALUE>`
-
-  Set the value of a string key to a string
-
-- `kvs get <KEY>`
-
-  Get the string value of a given string key
-
-- `kvs rm <KEY>`
-
-  Remove a given key
-
-- `kvs -V`
-
-  Print the version
-
-In this iteration though, the `get` and `set` commands will print to stderr the
-string, "unimplemented", and exiting with a non-zero exit code, indicating an
-error.
-
-You will use the `clap` crate to handle command-line arguments.
-
-_Find the latest version of the `clap` crate and add it to your dependencies in
-`Cargo.toml`._ There are a number of ways to find and import a crate, but
-pro-tip: check out the built-in [`cargo search`] and the plug-in [`cargo edit`].
-
-[`cargo search`]: https://doc.rust-lang.org/cargo/commands/cargo-search.html
-[`cargo edit`]: https://github.com/killercup/cargo-edit
-
-<!-- note: above is basically assuming that by now they know about
-crates.io, so expanding their world with the two CLI commands. -->
-
-<i>Next use [crates.io], [lib.rs], or [docs.rs] to find the documentation for
-the `clap` crate, and implement the command line interface such that the `cli_*`
-test cases pass.</i>
-
-<!-- note: above casually mentioning lib.rs and docs.rs to make sure they are aware. -->
-
-When you are testing, use `cargo run`; do not run the executable directly from
-the `target/` directory. When passing arguments to the program, separate them
-from the `cargo run` command with two dashes, `--`, like `cargo run -- get
-key1`.
-
-[crates.io]: https://crates.io
-[lib.rs]: https://lib.rs
-[docs.rs]: https://docs.rs
-
-
-## Part 3: Cargo environment variables
-
-When you set up `clap` to parse your command line arguments, you probably set
-the name, version, authors, and description (if not, do so). This information is
-redundant w/ values provided in `Cargo.toml`. Cargo sets environment variables
-that can be accessed through Rust source code, at build time.
-
-_Modify your `clap` setup to set these values from standard cargo environment
-variables._
-
-
-## Part 4: Store values in memory
-
-Now that your command line scaffolding is done, let's turn to the implementation
-of `KvStore`, and make the remaining test cases pass.
-
-The behavior of `KvStore`'s methods are fully-defined through the test cases
-themselves &mdash; you don't need any further description to complete the
-code for this project.
-
-_Make the remaining test cases pass by implementing methods on `KvStore`._
-
-
-## Part 5: Documentation
-
-You have implemented the project's functionality, but there are still a few more
-things to do before it is a polished piece of Rust software, ready for
-contributions or publication.
-
-First, public items should generally have doc comments.
-
-Doc comments are displayed in a crate's API documentation. API documentation can
-be generated with the command, `cargo doc`, which will render them as HTML to
-the `target/doc` folder. Note though that `target/doc` folder does not contain
-an `index.html`. In this project, your crate's documentation will be located at
-`target/doc/kvs/index.html`. You can launch a web browser at that location with
-`cargo doc --open`. `cargo doc --open` doesn't always work, e.g. if you are
-ssh'd into a cloud instance. If it doesn't though the command will print the
-name of the html file it couldn't open &mdash; useful simply for finding the
-location of your API docs.
-
-[Good doc comments][gdc] do not just repeat the name of the function, nor repeat
-information gathered from the type signature. They explain why and how one would
-use a function, what the return value is on both success and failure, error and
-panic conditions. The library you have written is very simple so the
-documentation can be simple as well. If you truly cannot think of anything
-useful to add through doc comments then it can be ok to not add a doc comment
-(this is a matter of preference). With no doc comments it should be obvious how
-the type or function is used from the name and type signature alone.
-
-Doc comments contain examples, and those examples can be tested with `cargo test
---doc`.
-
-_Add `#![deny(missing_docs)]` to the top of `src/lib.rs` to enforce that all
-public items have doc comments. Then add doc comments to the types and methods
-in your library. Follow the [documentation guidelines][gdc]. Give each an
-example and make sure they pass `cargo test --doc`._
-
-[gdc]: https://rust-lang-nursery.github.io/api-guidelines/documentation.html
-
-
-## Part 6: Ensure good style with `clippy` and `rustfmt`
-
-[`clippy`] and [`rustfmt`] are tools for enforcing common Rust style. `clippy`
-helps ensure that code uses modern idioms, and prevents patterns that commonly
-lead to errors. `rustfmt` enforces that code is formatted consistently. It's not
-necessary right now, but you might click those links and read their
-documentation. They are both sophisticated tools capable of much more than
-described below.
-
-[`clippy`]: https://github.com/rust-lang/rust-clippy
-[`rustfmt`]: https://github.com/rust-lang/rustfmt
-
-Both tools are included in the Rust toolchain, but not installed by default.
-They can be installed with the following [`rustup`] commands:
-
-```
-rustup component add clippy
-rustup component add rustfmt
-```
-
-[`rustup`]: https://github.com/rust-lang/rustup.rs/blob/master/README.md
+As with the previous project, go ahead and write enough empty or panicking
+definitions to make the test cases build.
 
 _Do that now._
 
-Both tools are invoked as cargo subcommands, `clippy` as `cargo clippy` and
-`rustfmt` as `cargo fmt`. Note that `cargo fmt` modifies your source code, so
-commit your work before making before running it to avoid accidentally making
-unwanted changes, after which you can either include the changes as part of the
-previous commit with `git commit --amend`. Or just commit them as their own
-formatting commit &mdash; it's common to rust both `clippy` and `rustfmt` after
-a series of commits, e.g. before submitting a pull request.
 
-_Run `cargo clippy` against your project and make any suggested changes. Run
-`cargo fmt` against your project and commit any changes it makes._
+## Part 1: Error handling
 
-It's worth reading the [`rustup`], [`clippy`], and [`rustfmt`] documentation, as
-these are tools you will be using frequently.
+In this project it will be possible for the code to fail due to I/O errors. So
+before we get started implementing a database we need to do one more thing that
+is crucial to Rust projects: decide on an error handling strategy.
 
-Congratulations, you are done with your first project! If you like you
-may complete the remaining "extensions". They are optional.
+<!-- TODO outline strategies? -->
 
-<!-- TODO add text about discovering components, and filtering with rg -->
+Rust's error handling is powerful, but involves a lot of boilerplate to use
+correctly. For this project the [`failure`] crate will provide the tools to
+easily handle errors of all kinds.
+
+[`failure`]: https://docs.rs/failure/0.1.5/failure/
+
+The [failure guide][fg] describes [several] error handling patterns.
+
+[fg]: https://boats.gitlab.io/failure/
+[several]: https://boats.gitlab.io/failure/guidance.html
+
+Pick one of those strategies and, in your library, either define your own error
+type or import `failure`s `Error`. This is the error type you will use in all of
+your `Result`s, converting error types from other crates to your own with the
+`?` operator.
+
+After that, define a type alias for `Result` that includes your concrete error
+type, so that you don't need to type `Result<T, YourErrorType>` everywhere, but
+can simply type `Result<T>`. This is a common Rust pattern.
+
+Finally, import those types into your executable with `use` statements, and
+change `main`s function signature to return `Result<()>`. All functions in your
+library that may fail will pass these `Results` back down the stack all the way
+to `main`, and then to the Rust runtime, which will print an error.
+
+Run `cargo check` to look for compiler errors, then fix them. For now it's
+ok to end `main` with `panic!()` to make the project build.
+
+_Set up your error handling strategy before continuing._
+
+As with the previous project, you'll want to create placeholder data structures
+and methods so that the tests compile. Now that you have defined an error type
+this should be straightforward. Add panics anywhere necessary to get the test
+suite to compile (`cargo test --no-run`).
+
+
+<!--
+## Aside: The history of Rust error handling
+-->
+
+_Note: Error-handling practices in Rust are still evolving. This course
+currently uses the [`failure`] crate to make defining error types easier. While
+`failure` has a good design, its use is [arguably not a best practice][nbp]. It
+may not continue to be viewed favorably by Rust experts. Future iterations
+of the course will likely not use `failure`. In the meantime, it is fine, and
+presents an opportunity to learn more of the history and nuance of Rust error
+handling._
+
+[nbp]: https://github.com/rust-lang-nursery/rust-cookbook/issues/502#issue-387418261
+
+<!--
+Rust error handling has a long and winding history. Expert Rust programmers will
+be aware of it, as that history informs and explains modern Rust error handling.
+
+TODO
+-->
+
+
+## Part 2: How the log behaves
+
+Now we are finally going to begin implementing the beginnings of a real database
+by reading and writing from disk. You will use [`serde`] to serialize the "set"
+and "rm" commands to a string, and the standard file I/O APIs to write it to
+disk.
+
+[`serde`]: https://serde.rs/
+
+This is the basic behavior of `kvs` with a log:
+
+- "set"
+  - The user invokes `kvs set mykey myvalue`
+   - `kvs` creates a value representing the "set" command, containing its key and
+    value
+  - It then serializes that command to a `String`
+  - It then appends the serialized command to a file containing the log
+  - If that succeeds, it exits silently with error code 0
+  - If it fails, it exits by printing the error and returning a non-zero error code
+- "get"
+  - The user invokes `kvs get mykey`
+  - `kvs` reads the entire log, one command at a time, recording the 
+   affected key and file offset of the command to an in-memory _key -> log
+    pointer_ map
+  - It then checks the map for the log pointer
+  - If it fails, it prints "Key not found", and exits with exit code 0
+  - If it succeeds
+    - It deserializes the command to get the last recorded value of the key
+    - It prints the value to stdout and exits with exit code 0
+- "rm"
+  - The user invokes `kvs rm mykey`
+  - Same as the "get" command, `kvs` reads the entire log to build the in-memory
+    index
+  - It then checks the map if the given key exists
+  - If the key does not exist, it prints "Key not found", and exits with a
+    non-zero error code
+  - If it succeeds
+    - It creates a value representing the "rm" command, containing its key
+    - It then appends the serialized command to the log
+    - If that succeeds, it exits silently with error code 0
+
+The log is a record of the transactions committed to the database. By
+"replaying" the records in the log on startup we reconstruct the previous state
+of the database.
+
+In this iteration you may store the value of the keys directly in memory (and
+thus never read from the log after initial startup and log replay). In a future
+iteration you will store only "log pointers" (file offsets) into the log.
+
+
+## Part 3: Writing to the log
+
+You will start by implementing the "set" flow. There are a number of steps here.
+Most of them are straightforward to implement and you can verify you've done so
+by running the appropriate `cli_*` test cases.
+
+`serde` is a large library, with many options, and supporting many serialization
+formats. Basic serialization and deserialization only requires annotating
+your data structure correctly, and calling a function to write it
+either to a `String` or a stream implementing `Write`.
+
+You need to pick a serialization format. Think about the properties you want in
+your serialization format &mdash; do you want to prioritize performance? Do you
+want to be able to read the content of the log in plain text? It's your choice,
+but maybe you should include a comment in the code explaining it.
+
+Other things to consider include: where is the system performing buffering and
+where do you need buffering? What is the impact of buffering on subsequent
+reads? When should you open and close file handles? For each command? For the
+lifetime of the `KvStore`?
+
+Some of the APIs you will call may fail, and return a `Result` of some error type.
+Make sure that your calling functions return a `Result` of _your own_ error type,
+and that you convert between the two with `?`.
+
+It is similar to implementing the "rm" command, but you should additionally
+check if the key exists before writing the command to the log. As we have two
+different commands that must be distinguished, you may use variants of a single
+enum type to represent each command. `serde` just works perfectly with enums.
+
+You may implement the "set" and "rm" commands now, focusing on the `set` / `rm`
+test cases, or you can proceed to the next section to read about the "get"
+command. It may help to keep both in mind, or to implement them both
+simultaneously. It is your choice.
+
+
+## Part 4: Reading from the log
+
+Now it's time to implement "get". In this part, you don't need to store
+log pointers in the index, we will leave the work to the next part. Instead,
+just read each command in the log on startup, executing them to save every key
+and value in the memory. Then read from the memory.
+
+Should you read all records in the log into memory at once and then replay
+them into your map type; or should you read them one at a time while
+replaying them into your map? Should you read into a buffer before deserializing
+or deserialize from a file stream? Think about the memory usage of your approach.
+Think about the way reading from I/O streams interacts with the kernel.
+
+Remember that "get" may not find a value and that case has to be handled
+specially. Here, our API returns `None` and our command line client prints
+a particular message and exits with a zero exit code.
+
+There's one complication to reading the log, and you may have already considered
+it while writing the "set" code: how do you distinguish between each record in
+the log? That is, how do you know when to stop reading one record, and start
+reading the next? Do you even need to? Maybe serde will deserialize a record
+directly from an I/O stream and stop reading when it's done, leaving the
+file cursor in the correct place to read subsequent records. Maybe serde will
+report an error when it sees two records back-to-back. Maybe you need to insert
+additional information to distinguish the length of each record. Maybe not.
+
+[`serde`]: https://serde.rs/
+
+_Implement "get" now_.
+
+
+## Part 5: Storing log pointers in the index
+
+At this point most, if not all (besides the compaction test), other test suite should all pass. The changes
+introduced in the next steps are simple optimizations, necessary for fast
+performance and reduced storage. As you implement them, pay attention to what
+exactly they are optimizing for.
+
+As we've described, the database you are building maintains an in-memory index
+of all keys in the database. That index maps from string keys to log pointers,
+not the values themselves.
+
+This change introduces the need to perform reads from the log
+at arbitrary offsets. Consider how that might impact the way
+you manage file handles.
+
+_If, in the previous steps, you elected to store the string values directly in
+memory, now is the time to update your code to store log pointers instead,
+loading from disk on demand._
+
+
+## Part 6: Stateless vs. stateful `KvStore`
+
+Remember that our project is both a library and a command-line program.
+They have sligtly different requirements: the `kvs` CLI commits a single change
+to disk, then exits (it is stateless); the `KvStore` type commits
+changes to disk, then stays resident in memory to service future
+queries (it is stateful).
+
+Is your `KvStore` stateful or stateless?
+
+_Make your `KvStore` retain the index in memory so it doesn't need to
+re-evaluate it for every call to `get`._
+
+
+## Part 7: Compacting the log
+
+At this point the database works just fine, but the log grows indefinitely. That
+is appropriate for some databases, but not the one we're building &mdash; we
+want to minimize disk usage as much as we can.
+
+So the final step in creating your database is to compact the log. Consider
+that as the log grows that multiple entries may set the value of a given key.
+Consider also that only the most recent command that modified a given key has
+any effect on the current value of that key:
+
+| idx | command |
+|:---:|:--------|
+| 0 | ~Command::Set("key-1", "value-1a")~ |
+| 20 | Command::Set("key-2", "value-2") |
+| | ... |
+| 100 | Command::Set("key-1", "value-1b") |
+
+In this example obviously the command at index 0 is redundant, so it doesn't
+need to be stored. Log compaction then is about rebuilding the log to remove
+redundancy:
+
+| idx | command |
+|:---:|:--------|
+| 0 | Command::Set("key-2", "value-2") |
+| | ... |
+| 99 | Command::Set("key-1", "value-1b") |
+
+Here's the basic algorithm you will use:
+
+<!-- TODO: Think about this. should the algorithm be specified? what _is_ a
+good heuristic to rebuild the log? always rebuild the entire log? -->
+
+_How_ you re-build the log is up to you. Consider questions like: what is the
+naive solution? How much memory do you need? What is the minimum amount of
+copying necessary to compact the log? Can the compaction be done in-place? How
+do you maintain data-integrity if compaction fails?
+
+So far we've been refering to "the log", but in actuallity it is common for a
+database to store many logs, in different files. You may find it easier to
+compact the log if you split your log across files.
+
+_Implement log compaction for your database._
+
+Congratulations! You have written a fully-functional database.
+
+If you are curious, now is a good time to start comparing the performance of
+your key/value store to others, like [sled], [bitcask], [badger], or [RocksDB].
+You might enjoy investigating their architectures, thinking about how theirs
+compare to yours, and how architecture affects performance. The next few
+projects will give you opportunities to optimize.
+
+[sled]: https://github.com/spacejam/sled
+[badger]: https://github.com/dgraph-io/badger
+[RocksDB]: https://rocksdb.org/
 
 Nice coding, friend. Enjoy a nice break.
 
 
----
-
-
 <!--
 
-TODO ## Aside: exploring Rust toolchain components
-
-rust component list
-rust component list | rg -v std # opportunity to introduce rg
-
--->
-
-
-## Extension 1: `structopt`
-
-In this project we used `clap` to parse command line arguments. It's typical to
-represent a program's parsed command line arguments as a struct, perhaps named
-`Config` or `Options`. Doing so requires calling the appropriate methods on
-`clap`'s `ArgMatches` type. Both steps, for larger programs, require _a lot_ of
-boilerplate code. The `structopt` crate greatly reduces boilerplate by allowing
-you to define a `Config` struct, annotated to automatically produce a `clap`
-command line parser that produces that struct. Some find this approach nicer
-than writing the `clap` code explicitly.
-
-_Modify your program to use `structopt` for parsing command line
-arguments instead of using `clap` directly._
-
-
-<!--
+- Potential readings
+  - error handling https://github.com/rust-lang-nursery/rust-cookbook/issues/502#issue-387418261
 
 ## TODOs
 
-- set the binary's name
-- ask about pros / cons of this main.rs setup
-  - explain why we're doing this setup
-    (makes main testable) though this will
-	become evident as they work through the tests
-- doc comments
-- make sure there's enough background reading to support the project
-- resources (whether / where to put these?)
-  - https://docs.rs/clap/2.32.0/clap/
-  - https://doc.rust-lang.org/cargo/reference/environment-variables.html#environment-variables-cargo
-  - https://rust-lang-nursery.github.io/api-guidelines/documentation.html#documentation
-  - https://doc.rust-lang.org/std/macro.env.html
-  - https://github.com/rust-lang/rust-clippy/blob/master/README.md
-  - https://github.com/rust-lang/rustfmt/blob/master/README.md
-- do range lookups (`scan`)?
-- README.md?
-- GitHub CI setup?
-- Add suggestions to read clippy and rustfmt documentation
-- Make clippy / rustfmt docs readings?
+- should flushing the log be part of the main project or an extension?
+- check terminology
+  - what's the correct term for the in-memory representation of the executed log?
+- is there a term for converting a log to it's permanent format?
+- custom main error handling
+- limits on k/v size?
+- maintaining data integrity on failure
+  - _must_ call flush at least
+- todo: `Result<Option<String>>` vs `Result<String>`
+  - is "not found" exit code 0 or !0?
+- error context
+- serialize directly to file stream
+- need readings for WAL
+- add code samples and digarams to illustrate the text and
+  be less monotonous
+- maintain the index file!
+- specify where data should be stored
+- caching the index
 
 -->
